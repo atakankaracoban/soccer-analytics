@@ -1,0 +1,439 @@
+"""
+Football Analytics Toolkit — Premier League
+NBA toolkit'inin futbol karşılığı.
+
+Veri kaynağı: FBref (via soccerdata) veya understatapi
+Odak: Oyuncu performans skorlaması, xG analizi, pozisyon bazlı değerlendirme
+
+Kurulum:
+    pip install soccerdata
+    pip install understatapi  (yedek seçenek)
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import LinearSegmentedColormap
+import warnings
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# VERİ KAYNAĞI SEÇİMİ
+# ============================================================
+# soccerdata → FBref üzerinden kapsamlı istatistikler
+# understatapi → xG odaklı, daha basit
+
+DATA_SOURCE = "fbref"   # "fbref" veya "understat"
+
+# ============================================================
+# FUTBOL ANALİTİĞİNİN TEMELLERİ
+# ============================================================
+#
+# NBA'den farklı olarak futbolda:
+#   - Puan yoktur → gol, asist, xG kullanılır
+#   - Pozisyon çok önemlidir → Defansif oyuncu ile FW kıyaslanamaz
+#   - 90 dakika normalizasyonu standart → "per 90" NBA'deki "per game" gibi
+#   - xG (Expected Goals): şutun golde çevrilme olasılığı
+#     0.0 = imkansız şut, 1.0 = boş kale
+#   - xA (Expected Assists): asiste dönüşen pasın golde çevrilme olasılığı
+#   - npxG: non-penalty xG (penaltı dahil değil, daha sağlıklı)
+
+
+# ============================================================
+# BÖLÜM 1: FBref ile Veri Çekme (soccerdata)
+# ============================================================
+
+def fetch_fbref_data(season="2024-2025"):
+    """
+    FBref'ten Premier League oyuncu istatistiklerini çek.
+    
+    FBref'teki tablolar:
+      - standard: Temel istatistikler (gol, asist, oyun süresi)
+      - shooting: Şut istatistikleri (xG dahil)
+      - passing: Pas istatistikleri (xA dahil)
+      - defense: Defansif istatistikler
+      - possession: Top hakimiyeti
+      - misc: Kart, foul vb.
+    """
+    try:
+        import soccerdata as sd
+        print(f"FBref'ten {season} Premier League verisi çekiliyor...")
+
+        fbref = sd.FBref(leagues="ENG-Premier League", seasons=season)
+
+        # Temel istatistikler
+        df_standard = fbref.read_player_season_stats(stat_type="standard")
+        df_shooting = fbref.read_player_season_stats(stat_type="shooting")
+        df_passing  = fbref.read_player_season_stats(stat_type="passing")
+        df_defense  = fbref.read_player_season_stats(stat_type="defense")
+
+        print(f"Standard: {len(df_standard)} kayıt")
+        print(f"Shooting: {len(df_shooting)} kayıt")
+
+        return df_standard, df_shooting, df_passing, df_defense
+
+    except ImportError:
+        print("soccerdata kurulu değil. 'pip install soccerdata' çalıştır.")
+        print("Şimdilik örnek veri ile devam ediliyor...\n")
+        return None, None, None, None
+
+
+# ============================================================
+# BÖLÜM 2: Örnek Veri (kütüphane olmadan test için)
+# ============================================================
+# Gerçek 2024-25 Premier League istatistikleri (FBref'ten manuel)
+# Bu sayede kütüphane olmadan da kodu test edebilirsin
+
+SAMPLE_PLAYERS = [
+    # name, team, pos, age, 90s, goals, assists, xG, xA, npxG, shots, sot, passes_completed, prog_passes, tackles, interceptions, pressures
+    ("Mohamed Salah",       "Liverpool",    "FW",  32, 28.5, 17, 13, 15.2, 10.1, 14.8, 98,  58, 1420, 89,  18, 22, 310),
+    ("Erling Haaland",      "Man City",     "FW",  24, 25.0, 19,  5, 21.3,  3.2, 19.1, 105, 61,  480, 22,   8, 10, 180),
+    ("Cole Palmer",         "Chelsea",      "MF",  22, 30.0, 14, 10, 12.8,  8.4, 12.4,  87, 44, 1680, 95,  28, 31, 420),
+    ("Alexander Isak",      "Newcastle",    "FW",  25, 26.0, 16,  6, 14.9,  4.1, 13.8,  92, 52,  510, 28,   9, 11, 190),
+    ("Bukayo Saka",         "Arsenal",      "FW",  23, 29.0, 13, 11, 11.4,  9.2, 11.0,  82, 41, 1590, 88,  31, 28, 480),
+    ("Bruno Fernandes",     "Man Utd",      "MF",  30, 30.0,  8, 12,  8.1, 10.2,  7.8, 71,  32, 1890, 112, 35, 38, 560),
+    ("Virgil van Dijk",     "Liverpool",    "DF",  33, 30.0,  3,  2,  1.8,  1.4,  1.6,  18,   8, 2240, 98,  68, 72, 620),
+    ("Trent Alexander-Arnold","Liverpool",  "DF",  26, 28.0,  3,  9,  2.2,  7.8,  2.0,  42,  18, 2480, 180, 42, 48, 510),
+    ("Declan Rice",         "Arsenal",      "MF",  26, 29.0,  5,  8,  4.2,  5.8,  3.9,  58,  24, 2210, 132, 82, 61, 780),
+    ("Phil Foden",          "Man City",     "MF",  24, 24.0,  9,  8,  8.4,  6.9,  8.1,  68,  35, 1720, 101, 26, 29, 390),
+    ("Son Heung-min",       "Tottenham",    "FW",  32, 29.0, 14,  9, 12.1,  7.2, 11.8,  88, 48,  980, 54,  22, 18, 280),
+    ("Jarrod Bowen",        "West Ham",     "FW",  28, 28.0, 11,  7,  9.8,  5.9,  9.4,  79, 39, 1080, 61,  28, 24, 320),
+    ("Martin Ødegaard",     "Arsenal",      "MF",  26, 20.0,  4,  6,  3.8,  5.1,  3.5,  48,  21, 1680, 118, 38, 44, 510),
+    ("Rodri",               "Man City",     "MF",  28,  8.0,  1,  2,  0.9,  1.8,  0.8,  14,   5, 820,  68,  42, 38, 310),
+    ("Nick Pope",           "Newcastle",    "GK",  32, 22.0,  0,  0,  0.0,  0.0,  0.0,   0,   0, 580,  12,   0,  0,  80),
+    ("Alisson Becker",      "Liverpool",    "GK",  32, 28.0,  0,  0,  0.0,  0.0,  0.0,   0,   0, 810,  18,   0,  0,  90),
+    ("Pedro Porro",         "Tottenham",    "DF",  25, 30.0,  2,  8,  1.8,  6.2,  1.6,  38,  16, 2180, 148, 58, 52, 590),
+    ("Gabriel Magalhães",   "Arsenal",      "DF",  27, 29.0,  5,  1,  3.2,  0.8,  3.0,  28,  10, 2310, 88,  75, 68, 640),
+    ("Dominic Solanke",     "Tottenham",    "FW",  27, 28.0, 12,  6, 11.4,  4.8, 10.9,  84, 44,  620, 34,  12, 14, 210),
+    ("Ollie Watkins",       "Aston Villa",  "FW",  29, 29.0, 13,  8, 12.8,  6.1, 12.2,  88, 48,  710, 40,  14, 16, 240),
+    ("Morgan Rogers",       "Aston Villa",  "MF",  22, 28.0,  9, 10,  7.2,  8.1,  6.9,  62, 30, 1580, 92,  38, 32, 480),
+    ("James Maddison",      "Tottenham",    "MF",  28, 24.0,  6,  8,  5.8,  7.2,  5.4,  58, 26, 1480, 98,  29, 33, 390),
+    ("Levi Colwill",        "Chelsea",      "DF",  21, 28.0,  2,  2,  1.4,  1.8,  1.2,  18,   7, 2180, 92,  62, 58, 580),
+    ("Matz Sels",           "Nottm Forest", "GK",  32, 30.0,  0,  0,  0.0,  0.0,  0.0,   0,   0, 720,  14,   0,  0,  85),
+    ("Chris Wood",          "Nottm Forest", "FW",  33, 27.0, 16,  4, 13.8,  3.2, 13.2,  76, 44,  480, 22,  10, 12, 180),
+]
+
+COLUMNS = [
+    "player", "team", "position", "age", "90s",
+    "goals", "assists", "xG", "xA", "npxG",
+    "shots", "shots_on_target",
+    "passes_completed", "progressive_passes",
+    "tackles", "interceptions", "pressures"
+]
+
+def load_sample_data():
+    """Örnek veriyi DataFrame'e yükle."""
+    df = pd.DataFrame(SAMPLE_PLAYERS, columns=COLUMNS)
+
+    # Per 90 normalizasyonu
+    # NBA'de "per game" neyse, futbolda "per 90" odur
+    # 90 dakika = 1 tam maç — farklı oyun sürelerini eşitler
+    per90_cols = ["goals", "assists", "xG", "xA", "npxG",
+                  "shots", "shots_on_target", "pressures",
+                  "tackles", "interceptions"]
+
+    for col in per90_cols:
+        df[f"{col}_p90"] = df[col] / df["90s"]
+
+    # Şut isabeti (shot accuracy)
+    df["shot_accuracy"] = df["shots_on_target"] / df["shots"].replace(0, np.nan)
+
+    # xG overperformance — gerçek gol vs beklenen gol
+    # Pozitif → şanslı veya elite finisher
+    # Negatif → şanssız veya zayıf finisher
+    df["xG_overperformance"] = df["goals"] - df["npxG"]
+
+    return df
+
+
+# ============================================================
+# BÖLÜM 3: Pozisyon Bazlı Performans Skoru
+# ============================================================
+# NBA'de tek bir efficiency formülü vardı.
+# Futbolda pozisyon çok daha belirleyici:
+#   - FW (Forvet): Gol, xG, şut kalitesi öncelikli
+#   - MF (Orta Saha): Yaratıcılık, pas, pressing dengesi
+#   - DF (Defans): Tackles, interceptions, pas güvenliği
+#   - GK (Kaleci): Ayrı metrikler gerekir (save %, PSxG)
+
+POSITION_WEIGHTS = {
+    "FW": {
+        "npxG_p90":          0.30,   # Non-penalty expected goals
+        "xA_p90":            0.20,   # Expected assists
+        "shot_accuracy":     0.15,   # Şut isabeti
+        "pressures_p90":     0.10,   # Pressing katkısı
+        "xG_overperformance":0.10,   # Finisher kalitesi
+        "assists_p90":       0.15,   # Gerçek asist
+    },
+    "MF": {
+        "xA_p90":            0.25,   # Yaratıcılık
+        "npxG_p90":          0.15,   # Gol tehdidi
+        "pressures_p90":     0.20,   # Pressing yoğunluğu
+        "tackles_p90":       0.15,   # Topla mücadele
+        "assists_p90":       0.15,   # Gerçek asist
+        "interceptions_p90": 0.10,   # Okuma oyunu
+    },
+    "DF": {
+        "tackles_p90":       0.30,   # Önleme
+        "interceptions_p90": 0.30,   # Okuma oyunu
+        "pressures_p90":     0.20,   # Pressing
+        "xA_p90":            0.10,   # Hücuma katkı
+        "npxG_p90":          0.10,   # Gol tehdidi (set piece)
+    },
+}
+
+def calculate_position_score(df):
+    """
+    Her oyuncu için pozisyona özel performans skoru hesapla.
+    
+    Yöntem: Her metriği 0-100 arasına normalize et,
+    sonra pozisyon ağırlıklarıyla ağırlıklı ortalama al.
+    Bu NBA'deki efficiency score hesabının aynısı — ama
+    pozisyon bazlı ağırlıklar ile.
+    """
+    from sklearn.preprocessing import MinMaxScaler
+
+    df = df.copy()
+    df["performance_score"] = np.nan
+
+    scaler = MinMaxScaler(feature_range=(0, 100))
+
+    for pos, weights in POSITION_WEIGHTS.items():
+        mask = df["position"] == pos
+        pos_df = df[mask].copy()
+
+        if len(pos_df) == 0:
+            continue
+
+        # Her metriği normalize et
+        metrics = list(weights.keys())
+        available = [m for m in metrics if m in pos_df.columns]
+
+        # NaN'ları 0 ile doldur
+        pos_df[available] = pos_df[available].fillna(0)
+
+        # Normalize
+        normalized = scaler.fit_transform(pos_df[available])
+        normalized_df = pd.DataFrame(normalized, columns=available, index=pos_df.index)
+
+        # Ağırlıklı toplam
+        score = sum(
+            normalized_df[m] * weights[m]
+            for m in available
+        )
+
+        df.loc[mask, "performance_score"] = score
+
+    return df
+
+
+# ============================================================
+# BÖLÜM 4: xG Analizi — Futbolun En Önemli Metriği
+# ============================================================
+
+def xg_analysis(df):
+    """
+    xG overperformance analizi.
+    
+    Kim gerçekten elite finisher, kim şanslı?
+    Kim şanssız, kim pozisyon almıyor?
+    """
+    print("\n" + "=" * 60)
+    print("xG ANALİZİ — Expected Goals vs Gerçek Goller")
+    print("=" * 60)
+
+    # Sadece forvetler ve attacklı orta sahalar
+    attackers = df[df["position"].isin(["FW", "MF"])].copy()
+    attackers = attackers[attackers["shots"] >= 20].copy()  # Minimum şut filtresi
+
+    print("\n--- xG Overperformance (Elite Finisher'lar) ---")
+    print("Pozitif = Beklentinin üzerinde gol attı (elite finisher)")
+    print("Negatif = Beklentinin altında gol attı (şanssız veya zayıf finisher)\n")
+
+    top = attackers.nlargest(10, "xG_overperformance")[
+        ["player", "team", "goals", "npxG", "xG_overperformance", "shots"]
+    ].round(2)
+    print("En iyi finisher'lar:")
+    print(top.to_string(index=False))
+
+    bottom = attackers.nsmallest(5, "xG_overperformance")[
+        ["player", "team", "goals", "npxG", "xG_overperformance", "shots"]
+    ].round(2)
+    print("\nŞanssız / zayıf finisher'lar:")
+    print(bottom.to_string(index=False))
+
+    # xG vs Gol scatter plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.patch.set_facecolor("#1a1a2e")
+
+    # Sol: xG vs Gerçek Gol
+    ax1 = axes[0]
+    ax1.set_facecolor("#16213e")
+
+    colors = ["#e94560" if x > 0 else "#4fc3f7"
+              for x in attackers["xG_overperformance"]]
+
+    ax1.scatter(attackers["npxG"], attackers["goals"],
+                c=colors, s=80, alpha=0.8, zorder=3)
+
+    # Diagonal çizgi — perfect performance
+    max_val = max(attackers[["npxG", "goals"]].max())
+    ax1.plot([0, max_val], [0, max_val],
+             color="#888", linestyle="--", alpha=0.5, label="xG = Gol")
+
+    # İsim etiketleri
+    for _, row in attackers.iterrows():
+        if abs(row["xG_overperformance"]) > 2:
+            ax1.annotate(row["player"].split()[-1],
+                        (row["npxG"], row["goals"]),
+                        fontsize=7, color="white", alpha=0.9,
+                        xytext=(4, 4), textcoords="offset points")
+
+    ax1.set_xlabel("npxG (Expected Goals)", color="white")
+    ax1.set_ylabel("Gerçek Goller", color="white")
+    ax1.set_title("xG vs Gerçek Gol\nKırmızı = Overperform, Mavi = Underperform",
+                  color="white", fontsize=11)
+    ax1.tick_params(colors="white")
+    ax1.spines["bottom"].set_color("#444")
+    ax1.spines["left"].set_color("#444")
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+
+    # Sağ: Pozisyon bazlı performans skoru
+    ax2 = axes[1]
+    ax2.set_facecolor("#16213e")
+
+    scored = df[df["performance_score"].notna()].nlargest(15, "performance_score")
+
+    pos_colors = {"FW": "#e94560", "MF": "#f0a500", "DF": "#4fc3f7"}
+    bar_colors = [pos_colors.get(p, "#888") for p in scored["position"]]
+
+    bars = ax2.barh(range(len(scored)), scored["performance_score"],
+                    color=bar_colors, alpha=0.85, height=0.7)
+
+    ax2.set_yticks(range(len(scored)))
+    ax2.set_yticklabels(
+        [f"{r['player'].split()[-1]} ({r['team'][:3].upper()})"
+         for _, r in scored.iterrows()],
+        fontsize=8, color="white"
+    )
+    ax2.set_xlabel("Performans Skoru (0-100)", color="white")
+    ax2.set_title("Top 15 — Pozisyon Bazlı Performans\n(Kırmızı=FW, Sarı=MF, Mavi=DF)",
+                  color="white", fontsize=11)
+    ax2.tick_params(colors="white")
+    ax2.spines["bottom"].set_color("#444")
+    ax2.spines["left"].set_color("#444")
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+
+    for i, (bar, (_, row)) in enumerate(zip(bars, scored.iterrows())):
+        ax2.text(bar.get_width() + 0.5, i,
+                f"{row['performance_score']:.1f}",
+                va="center", fontsize=7, color="white")
+
+    plt.tight_layout(pad=2)
+    plt.savefig("football_analysis.png", dpi=150,
+                bbox_inches="tight", facecolor="#1a1a2e")
+    plt.show()
+    print("\nGrafik kaydedildi: football_analysis.png")
+
+
+# ============================================================
+# BÖLÜM 5: Takım Bazlı Özet
+# ============================================================
+
+def team_summary(df):
+    """Takım bazlı ortalama performans skoru."""
+    print("\n" + "=" * 60)
+    print("TAKIM BAZLI ÖZET")
+    print("=" * 60)
+
+    team_stats = df.groupby("team").agg(
+        oyuncu_sayisi=("player", "count"),
+        ort_performans=("performance_score", "mean"),
+        toplam_gol=("goals", "sum"),
+        toplam_xG=("xG", "sum"),
+        ort_xG_p90=("xG_p90", "mean"),
+    ).round(2)
+
+    team_stats = team_stats.sort_values("ort_performans", ascending=False)
+    print(team_stats.to_string())
+
+
+# ============================================================
+# BÖLÜM 6: NBA ile Karşılaştırma — Metodoloji Notu
+# ============================================================
+
+def methodology_comparison():
+    """NBA ve futbol analitik yaklaşımlarının karşılaştırması."""
+    print("\n" + "=" * 60)
+    print("METODOLOJİ KARŞILAŞTIRMASI: NBA vs Futbol")
+    print("=" * 60)
+
+    comparison = {
+        "Temel birim":        ("Per Game",     "Per 90 dakika"),
+        "Gol beklentisi":     ("yok (PTS var)", "xG (beklenen gol)"),
+        "Asist beklentisi":   ("AST direkt",    "xA (beklenen asist)"),
+        "Pozisyon etkisi":    ("Düşük",         "Çok Yüksek"),
+        "Savunma ölçümü":     ("STL, BLK",      "Tackles, Interceptions, Pressures"),
+        "Efficiency metriği": ("PER, VORP",     "xG+xA p90, npxG"),
+        "Veri kaynağı":       ("nba_api",       "FBref, StatsBomb, Opta"),
+    }
+
+    print(f"\n{'Kavram':<25} {'NBA':<20} {'Futbol'}")
+    print("-" * 65)
+    for concept, (nba, football) in comparison.items():
+        print(f"{concept:<25} {nba:<20} {football}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("Football Analytics Toolkit — Premier League")
+    print("=" * 50)
+
+    # Veri yükle
+    # Gerçek veri için: df_std, df_shoot, df_pass, df_def = fetch_fbref_data()
+    # Şimdilik örnek veri:
+    df = load_sample_data()
+    print(f"Yüklendi: {len(df)} oyuncu")
+    print(f"Takımlar: {df['team'].nunique()}")
+    print(f"Pozisyonlar: {df['position'].value_counts().to_dict()}")
+
+    # Performans skoru hesapla
+    df = calculate_position_score(df)
+    print("\nPerformans skorları hesaplandı.")
+
+    # Top 10 — pozisyon bazlı
+    print("\n--- Top 10 Oyuncu (Pozisyon Bazlı Skor) ---")
+    top10 = df[df["performance_score"].notna()].nlargest(10, "performance_score")[
+        ["player", "team", "position", "goals", "assists",
+         "xG", "xA", "performance_score"]
+    ].round(2)
+    print(top10.to_string(index=False))
+
+    # xG analizi + görselleştirme
+    xg_analysis(df)
+
+    # Takım özeti
+    team_summary(df)
+
+    # Metodoloji karşılaştırması
+    methodology_comparison()
+
+    # Veriyi CSV olarak kaydet
+    df.to_csv("premier_league_analysis.csv", index=False)
+    print("\nVeri kaydedildi: premier_league_analysis.csv")
+
+    print("\n" + "=" * 50)
+    print("Gerçek FBref verisi için:")
+    print("  pip install soccerdata")
+    print("  Sonra main() içinde fetch_fbref_data() kullan")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()
